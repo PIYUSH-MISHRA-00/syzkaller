@@ -8499,7 +8499,7 @@ static void sandbox_common()
 	setrlimit(RLIMIT_FSIZE, &rlim);
 	rlim.rlim_cur = rlim.rlim_max = 1 << 20;
 	setrlimit(RLIMIT_STACK, &rlim);
-	rlim.rlim_cur = rlim.rlim_max = 0;
+	rlim.rlim_cur = rlim.rlim_max = 128 << 20;
 	setrlimit(RLIMIT_CORE, &rlim);
 	rlim.rlim_cur = rlim.rlim_max = 256;
 	setrlimit(RLIMIT_NOFILE, &rlim);
@@ -11220,6 +11220,11 @@ static void use_temporary_dir(void)
 #error "unknown OS"
 #endif
 
+#if SYZ_TEST_COMMON_EXT_EXAMPLE
+#include "common_ext_example.h"
+#else
+
+#endif
 
 #if SYZ_EXECUTOR || __NR_syz_execute_func
 static long syz_execute_func(volatile long text)
@@ -11364,6 +11369,9 @@ static void loop(void)
 #endif
 #if SYZ_HAVE_SETUP_TEST
 			setup_test();
+#endif
+#if SYZ_HAVE_SETUP_EXT_TEST
+			setup_ext_test();
 #endif
 #if GOOS_akaros
 #if SYZ_EXECUTOR

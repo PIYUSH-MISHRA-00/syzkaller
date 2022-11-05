@@ -70,6 +70,7 @@ func ctorLinux(cfg *config) (reporterImpl, []string, error) {
 		regexp.MustCompile(`^mm/percpu.*`),
 		regexp.MustCompile(`^mm/vmalloc.c`),
 		regexp.MustCompile(`^mm/page_alloc.c`),
+		regexp.MustCompile(`^mm/mempool.c`),
 		regexp.MustCompile(`^mm/util.c`),
 		regexp.MustCompile(`^kernel/rcu/.*`),
 		regexp.MustCompile(`^arch/.*/kernel/traps.c`),
@@ -919,6 +920,7 @@ var linuxStallAnchorFrames = []*regexp.Regexp{
 	compile("do_fast_syscall_"),  // syscall entry
 	compile("sysenter_dispatch"), // syscall entry
 	compile("tracesys_phase2"),   // syscall entry
+	compile("el0_svc_handler"),   // syscall entry
 	compile("ret_fast_syscall"),  // arm syscall entry
 	compile("netif_receive_skb"), // net receive entry point
 	compile("do_softirq"),
@@ -962,14 +964,14 @@ var linuxStallAnchorFrames = []*regexp.Regexp{
 	compile("^sock_recvmsg"),
 	compile("^sock_release"),
 	compile("^__sock_release"),
-	compile("__sys_setsockopt"),
+	compile("^setsockopt$"),
 	compile("kernel_setsockopt"),
 	compile("sock_common_setsockopt"),
-	compile("__sys_listen"),
+	compile("^listen$"),
 	compile("kernel_listen"),
 	compile("sk_common_release"),
 	compile("^sock_mmap"),
-	compile("__sys_accept"),
+	compile("^accept$"),
 	compile("kernel_accept"),
 	compile("^sock_do_ioctl"),
 	compile("^sock_ioctl"),
@@ -1037,6 +1039,7 @@ var linuxStackParams = &stackParams{
 		"report_bug",
 		"fixup_bug",
 		"print_report",
+		"print_usage_bug",
 		"do_error",
 		"invalid_op",
 		"_trap",
@@ -1087,21 +1090,16 @@ var linuxStackParams = &stackParams{
 		"down_trylock",
 		"up_read",
 		"up_write",
-		"mutex_lock",
-		"mutex_trylock",
-		"mutex_unlock",
-		"mutex_remove_waiter",
+		"^mutex_",
+		"^__mutex_",
+		"owner_on_cpu",
 		"osq_lock",
 		"osq_unlock",
 		"atomic(64)?_(dec|inc|read|set|or|xor|and|add|sub|fetch|xchg|cmpxchg|try)",
 		"(set|clear|change|test)_bit",
 		"__wake_up",
-		"refcount_add",
-		"refcount_sub",
-		"refcount_inc",
-		"refcount_dec",
-		"refcount_set",
-		"refcount_read",
+		"^refcount_",
+		"^kref_",
 		"ref_tracker",
 		"seqprop_assert",
 		"memcpy",
@@ -1163,9 +1161,7 @@ var linuxStackParams = &stackParams{
 		"destroy_workqueue",
 		"finish_wait",
 		"kthread_stop",
-		"kobject_del",
-		"kobject_put",
-		"kobject_uevent_env",
+		"kobject_",
 		"add_uevent_var",
 		"get_device_parent",
 		"device_add",
@@ -1206,6 +1202,12 @@ var linuxStackParams = &stackParams{
 		"^crc\\d+",
 		"__might_resched",
 		"assertfail",
+		"^iput$",
+		"^iput_final$",
+		"^ihold$",
+		"hex_dump_to_buffer",
+		"print_hex_dump",
+		"^klist_",
 	},
 	corruptedLines: []*regexp.Regexp{
 		// Fault injection stacks are frequently intermixed with crash reports.
@@ -1216,6 +1218,9 @@ var linuxStackParams = &stackParams{
 		"SYSC_",
 		"SyS_",
 		"sys_",
+		"__x64_",
+		"__ia32_",
+		"__arm64_",
 		"____sys_",
 		"___sys_",
 		"__sys_",
@@ -1223,9 +1228,6 @@ var linuxStackParams = &stackParams{
 		"__do_sys_",
 		"compat_SYSC_",
 		"compat_SyS_",
-		"__x64_",
-		"__ia32_",
-		"__arm64_",
 		"ksys_",
 	},
 }
@@ -1552,6 +1554,7 @@ var linuxOopses = append([]*oops{
 			{
 				title: compile("BUG: .*stack guard page was hit at"),
 				fmt:   "BUG: stack guard page was hit in %[1]v",
+				alt:   []string{"stack-overflow in %[1]v"},
 				stack: &stackFmt{
 					parts: []*regexp.Regexp{
 						linuxRipFrame,
@@ -1634,9 +1637,9 @@ var linuxOopses = append([]*oops{
 				fmt:    "WARNING: still has locks held in %[1]v",
 			},
 			{
-				title:  compile("WARNING: Nested lock was not taken"),
-				report: compile("WARNING: Nested lock was not taken(?:.*\\n)+?.*at: {{FUNC}}"),
-				fmt:    "WARNING: nested lock was not taken in %[1]v",
+				title: compile("WARNING: Nested lock was not taken"),
+				fmt:   "WARNING: nested lock was not taken in %[1]v",
+				stack: warningStackFmt(),
 			},
 			{
 				title:        compile("WARNING: lock held when returning to user space"),
@@ -1705,7 +1708,13 @@ var linuxOopses = append([]*oops{
 			{
 				title:  compile("WARNING: inconsistent lock state"),
 				report: compile("WARNING: inconsistent lock state(?:.*\\n)+?.*takes(?:.*\\n)+?.*at: (?:{{PC}} +)?{{FUNC}}"),
-				fmt:    "inconsistent lock state in %[1]v",
+				fmt:    "inconsistent lock state in %[2]v",
+				stack: &stackFmt{
+					parts: []*regexp.Regexp{
+						linuxCallTrace,
+						parseStackTrace,
+					},
+				},
 			},
 			{
 				title:  compile("WARNING: suspicious RCU usage"),
@@ -1972,12 +1981,26 @@ var linuxOopses = append([]*oops{
 				title:  compile("Kernel panic - not syncing: corrupted stack end"),
 				report: compile("Kernel panic - not syncing: corrupted stack end detected inside scheduler"),
 				fmt:    "kernel panic: corrupted stack end in %[1]v",
+				alt:    []string{"stack-overflow in %[1]v"},
 				stack: &stackFmt{
 					parts: []*regexp.Regexp{
 						linuxCallTrace,
 						parseStackTrace,
 					},
 					skip:      []string{"schedule", "retint_kernel"},
+					extractor: linuxStallFrameExtractor,
+				},
+			},
+			{
+				title: compile("Kernel panic - not syncing: kernel stack overflow"),
+				fmt:   "kernel stack overflow in %[1]v",
+				alt:   []string{"stack-overflow in %[1]v"},
+				stack: &stackFmt{
+					parts: []*regexp.Regexp{
+						linuxCallTrace,
+						parseStackTrace,
+					},
+					skip:      []string{"bad_stack"},
 					extractor: linuxStallFrameExtractor,
 				},
 			},
@@ -2059,7 +2082,6 @@ var linuxOopses = append([]*oops{
 			{
 				title: compile("kernel BUG at (.*)"),
 				fmt:   "kernel BUG in %[2]v",
-				alt:   []string{"kernel BUG at %[1]v"}, // historical title required for merging with existing bugs
 				stack: &stackFmt{
 					parts: []*regexp.Regexp{
 						linuxRipFrame,
